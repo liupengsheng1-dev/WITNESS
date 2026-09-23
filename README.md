@@ -1,1 +1,3 @@
 # WITNESS
+
+As part of this work, we construct SynConFact, a synthetic counterfactual vision-language dataset designed to evaluate how vision-language models respond to conflicts between visual information and prior knowledge. The dataset is available through our anonymous dataset repository. To use it, download the dataset files, extract any archives, and preserve the original directory structure. Set the dataset paths in your evaluation setup to the corresponding local locations. SynConFact covers six categories: animal, attribute, historical, material, object, and scene. Each example includes a counterfactual image, a textual prompt, and factual_tokens and counterfactual_tokens annotations for next-token evaluation.
