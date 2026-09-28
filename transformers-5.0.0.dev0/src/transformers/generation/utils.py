@@ -2293,7 +2293,6 @@ class GenerationMixin(ContinuousMixin):
         stopping_criteria: StoppingCriteriaList | None = None,
         prefix_allowed_tokens_fn: Callable[[int, torch.Tensor], list[int]] | None = None,
         synced_gpus: bool | None = None,
-        deck_decoding: bool | None = None,
         enhance_decoding: bool | None = None,
         assistant_model: Optional["PreTrainedModel"] = None,
         student_model: Optional["PreTrainedModel"] = None,
@@ -2513,7 +2512,7 @@ class GenerationMixin(ContinuousMixin):
             generation_config, use_model_defaults, **kwargs
         )
         kwargs_student = {"max_new_tokens": kwargs["max_new_tokens"]}
-        if deck_decoding or enhance_decoding:
+        if enhance_decoding:
             generation_config_student, model_kwargs_student = self._prepare_generation_config(
                 generation_config_student, use_model_defaults, **kwargs_student
             )
@@ -2730,23 +2729,8 @@ class GenerationMixin(ContinuousMixin):
         model_kwargs["attention_mask_student"] = model_kwargs_student.get("attention_mask", None)
 
         # 9. Call sample mode
-        if deck_decoding:
-            result = self.deck_sample(
-                input_ids,
-                input_ids_student,
-                logits_processor=prepared_logits_processor,
-                stopping_criteria=prepared_stopping_criteria,
-                generation_config=generation_config,
-                student_model=student_model,
-                alpha=alpha,
-                adaptive=adaptive,
-                select_top=select_top,
-                **generation_mode_kwargs,
-                **model_kwargs,
-            )
-        
-        elif enhance_decoding:
-            result = self.enhance_sample(
+        if enhance_decoding:
+            result = self.witness_sample(
                 input_ids,
                 input_ids_student,
                 logits_processor=prepared_logits_processor,
@@ -3057,235 +3041,6 @@ class GenerationMixin(ContinuousMixin):
         else:
             return input_ids
 
-    def deck_sample(
-        self,
-        input_ids: torch.LongTensor,
-        input_ids_student: torch.LongTensor,
-        logits_processor: LogitsProcessorList,
-        stopping_criteria: StoppingCriteriaList,
-        generation_config: GenerationConfig,
-        student_model = None,
-        synced_gpus: bool = False,
-        streamer: Optional["BaseStreamer"] = None,
-        alpha: float | None = None,
-        adaptive: bool | None = None,
-        select_top: int | None = 10,
-        **model_kwargs,
-    ) -> GenerateNonBeamOutput | torch.LongTensor:
-        r"""
-        Generates sequences of token ids for models with a language modeling head using **multinomial sampling** and
-        can be used for text-decoder, text-to-text, speech-to-text, and vision-to-text models.
-
-        Parameters:
-            input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
-                The sequence used as a prompt for the generation.
-            logits_processor (`LogitsProcessorList`):
-                An instance of [`LogitsProcessorList`]. List of instances of class derived from [`LogitsProcessor`]
-                used to modify the prediction scores of the language modeling head applied at each generation step.
-            stopping_criteria (`StoppingCriteriaList`):
-                An instance of [`StoppingCriteriaList`]. List of instances of class derived from [`StoppingCriteria`]
-                used to tell if the generation loop should stop.
-            generation_config ([`~generation.GenerationConfig`]):
-                The generation configuration to be used as parametrization of the decoding method.
-            synced_gpus (`bool`):
-                Whether to continue running the while loop until max_length (needed to avoid deadlocking with
-                `FullyShardedDataParallel` and DeepSpeed ZeRO Stage 3).
-            streamer (`BaseStreamer`, *optional*):
-                Streamer object that will be used to stream the generated sequences. Generated tokens are passed
-                through `streamer.put(token_ids)` and the streamer is responsible for any further processing.
-            model_kwargs:
-                Additional model specific kwargs will be forwarded to the `forward` function of the model. If model is
-                an encoder-decoder model the kwargs should include `encoder_outputs`.
-
-        Return:
-            [`~generation.GenerateDecoderOnlyOutput`], [`~generation.GenerateEncoderDecoderOutput`] or `torch.LongTensor`:
-            A `torch.LongTensor` containing the generated tokens (default behaviour) or a
-            [`~generation.GenerateDecoderOnlyOutput`] if `model.config.is_encoder_decoder=False` and
-            `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
-            `model.config.is_encoder_decoder=True`.
-        """
-        # init values
-        if student_model is None:
-            raise ValueError("deck_sample requires a separate student_model")
-        model_kwargs_student = copy.deepcopy(model_kwargs)
-        model_kwargs_student["attention_mask"] = model_kwargs["attention_mask_student"]
-        del model_kwargs["attention_mask_student"]
-        del model_kwargs_student["attention_mask_student"]
-        if "pixel_values" in model_kwargs_student:
-            del model_kwargs_student["pixel_values"]
-        if "image_grid_thw" in model_kwargs_student:
-            del model_kwargs_student["image_grid_thw"]
-        if "image_sizes" in model_kwargs_student:
-            del model_kwargs_student["image_sizes"]
-        if "batch_num_images" in model_kwargs_student:
-            del model_kwargs_student["batch_num_images"]
-        pad_token_id = generation_config._pad_token_tensor
-        output_attentions = generation_config.output_attentions
-        output_hidden_states = generation_config.output_hidden_states
-        output_scores = generation_config.output_scores
-        output_logits = generation_config.output_logits
-        return_dict_in_generate = generation_config.return_dict_in_generate
-        has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
-        do_sample = generation_config.do_sample
-
-        # init attention / hidden states / scores tuples
-        scores = () if (return_dict_in_generate and output_scores) else None
-        raw_logits = () if (return_dict_in_generate and output_logits) else None
-        decoder_attentions = () if (return_dict_in_generate and output_attentions) else None
-        cross_attentions = () if (return_dict_in_generate and output_attentions) else None
-        decoder_hidden_states = () if (return_dict_in_generate and output_hidden_states) else None
-
-        # if model is an encoder-decoder, retrieve encoder attention weights and hidden states
-        if return_dict_in_generate and self.config.is_encoder_decoder:
-            encoder_attentions = model_kwargs["encoder_outputs"].get("attentions") if output_attentions else None
-            encoder_hidden_states = (
-                model_kwargs["encoder_outputs"].get("hidden_states") if output_hidden_states else None
-            )
-
-        # keep track of which sequences are already finished
-        batch_size, cur_len = input_ids.shape[:2]
-        this_peer_finished = False
-        unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-
-        model_forward = (
-            self.get_compiled_call(generation_config.compile_config)
-            if self._valid_auto_compile_criteria(model_kwargs, generation_config)
-            else self.__call__
-        )
-
-        prefill_consumed = False
-        outputs = self._prefill(input_ids, generation_config, model_kwargs)
-        logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
-        outputs_student = student_model._prefill(input_ids_student, generation_config, model_kwargs_student)
-        logits_student = outputs_student.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
-
-        cur_len = 0
-        while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
-            if prefill_consumed:
-                model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-                outputs = model_forward(**model_inputs, return_dict=True)
-                logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
-                model_inputs_student = student_model.prepare_inputs_for_generation(input_ids_student, **model_kwargs_student)
-                outputs_student = student_model(**model_inputs_student, return_dict=True)
-                logits_student = outputs_student.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
-
-            cur_len += 1
-            prefill_consumed = True
-            model_kwargs = self._update_model_kwargs_for_generation(
-                outputs,
-                model_kwargs,
-                is_encoder_decoder=self.config.is_encoder_decoder,
-            )
-            model_kwargs_student = student_model._update_model_kwargs_for_generation(
-                outputs_student,
-                model_kwargs_student,
-                is_encoder_decoder=student_model.config.is_encoder_decoder,
-            )
-            if synced_gpus and this_peer_finished:
-                continue
-
-            next_token_logits, next_token_logits_student, mask = self.relative_top_filter(logits, logits_student, relative_top = 0.1, min_tokens_to_keep=select_top)
-            logits_context = next_token_logits - next_token_logits_student
-            logits_context[mask] = -1e10
-
-            probs = nn.functional.softmax(next_token_logits, dim=-1)
-            probs_student = nn.functional.softmax(next_token_logits_student, dim=-1)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1).item()
-            entropy_student = -torch.sum(probs_student * torch.log(probs_student + 1e-9), dim=-1).item()
-            is_adaptive = adaptive
-            IG = entropy_student - entropy
-            e = -1.0
-            is_adjust = IG + abs(entropy) * e < 0
-            if is_adjust:
-                if is_adaptive:
-                    diff = abs(entropy - entropy_student)
-                    normalization_factor = 1 + diff / (entropy + entropy_student)
-                    next_token_logits_student = 2 * next_token_logits_student * entropy / (entropy + entropy_student * normalization_factor)
-                    logits_context = 2 * logits_context * entropy_student / (entropy + entropy_student * normalization_factor)
-                    logits_adjust = next_token_logits_student + logits_context
-                    next_token_scores = logits_processor(input_ids, logits_adjust)
-                else:
-                    logits_adjust = alpha * next_token_logits_student + (1 - alpha) * logits_context
-                    next_token_scores = logits_processor(input_ids, logits_adjust)
-            else:
-                next_token_scores = logits_processor(input_ids, next_token_logits)
-
-            if return_dict_in_generate:
-                if output_scores:
-                    scores += (next_token_scores,)
-                if output_logits:
-                    raw_logits += (next_token_logits,)
-                if output_attentions:
-                    decoder_attentions += (
-                        (outputs.decoder_attentions,) if self.config.is_encoder_decoder else (outputs.attentions,)
-                    )
-                    if self.config.is_encoder_decoder:
-                        cross_attentions += (outputs.cross_attentions,)
-
-                if output_hidden_states:
-                    decoder_hidden_states += (
-                        (outputs.decoder_hidden_states,)
-                        if self.config.is_encoder_decoder
-                        else (outputs.hidden_states,)
-                    )
-            
-            # token selection
-            if do_sample:
-                probs = nn.functional.softmax(next_token_scores, dim=-1)
-                # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            else:
-                next_tokens = torch.argmax(next_token_scores, dim=-1)
-
-            # finished sentences should have their next token be a padding token
-            if has_eos_stopping_criteria:
-                next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
-
-            # update generated ids, model inputs, and length for next step
-            input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-            input_ids_student = torch.cat([input_ids_student, next_tokens[:, None]], dim=-1)
-
-            if streamer is not None:
-                streamer.put(next_tokens.cpu())
-
-            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, scores)
-            this_peer_finished = unfinished_sequences.max() == 0
-
-            # This is needed to properly delete outputs.logits which may be very large for first iteration
-            # Otherwise a reference to outputs is kept which keeps the logits alive in the next iteration
-            del outputs
-
-        if streamer is not None:
-            streamer.end()
-
-        if return_dict_in_generate:
-            cache = None
-            if any(cache_key in model_kwargs for cache_key in ALL_CACHE_NAMES):
-                cache_key = next(cache_key for cache_key in ALL_CACHE_NAMES if cache_key in model_kwargs)
-                cache = model_kwargs[cache_key]
-            if self.config.is_encoder_decoder:
-                return GenerateEncoderDecoderOutput(
-                    sequences=input_ids,
-                    scores=scores,
-                    logits=raw_logits,
-                    encoder_attentions=encoder_attentions,
-                    encoder_hidden_states=encoder_hidden_states,
-                    decoder_attentions=decoder_attentions,
-                    cross_attentions=cross_attentions,
-                    decoder_hidden_states=decoder_hidden_states,
-                    past_key_values=cache,
-                )
-            else:
-                return GenerateDecoderOnlyOutput(
-                    sequences=input_ids,
-                    scores=scores,
-                    logits=raw_logits,
-                    attentions=decoder_attentions,
-                    hidden_states=decoder_hidden_states,
-                    past_key_values=cache,
-                )
-        else:
-            return input_ids
 
     def relative_top_filter(self, scores, scores_student, relative_top=None, filter_value=-1e10, min_tokens_to_keep=None):
         sorted_logits, sorted_indices = torch.sort(scores, descending=True)
@@ -3308,7 +3063,7 @@ class GenerationMixin(ContinuousMixin):
 
         return scores, scores_student, mask
 
-    def enhance_sample(
+    def witness_sample(
         self,
         input_ids: torch.LongTensor,
         input_ids_student: torch.LongTensor,
@@ -3357,7 +3112,7 @@ class GenerationMixin(ContinuousMixin):
         """
         # init values
         if student_model is None:
-            raise ValueError("deck_sample requires a separate student_model")
+            raise ValueError("witness_sample requires a separate student_model")
         model_kwargs_student = copy.deepcopy(model_kwargs)
         model_kwargs_student["attention_mask"] = model_kwargs["attention_mask_student"]
         del model_kwargs["attention_mask_student"]
@@ -3407,121 +3162,6 @@ class GenerationMixin(ContinuousMixin):
         )
         prefill_consumed = False
         cur_len = 0
-        
-
-        project_root = "/data/research_users/liupengsheng/DeCK-image"
-        if project_root not in sys.path:
-            sys.path.append(project_root)
-        from heatmap import save_attention_heatmap, save_attn_sum_bar, plot_valid_logits_by_token_id_paper, plot_head_score_token_logits_broken, plot_single_logits_by_token_id_paper, plot_head_correlation_heatmap
-        
-        # all_head_image_attn_map = None
-        # valid_head_num = 0
-        # for h in range(28):
-        #     model_kwargs_h = copy.copy(model_kwargs)
-        #     head_attn = self.enhance_prefill(
-        #         input_ids,
-        #         generation_config,
-        #         model_kwargs_h,
-        #         return_head_attn=True,
-        #         attn_layer=-1,
-        #         attn_head=h
-        #     )
-        #     head_attn = head_attn[0]
-        #     last_token_attn = head_attn[-1]
-
-        #     # 计算 image_attn_sum
-        #     image_token_id = self.config.image_token_id
-        #     image_token_indices = (input_ids[0] == image_token_id).nonzero(as_tuple=True)[0]
-        #     image_attn_sum = last_token_attn[image_token_indices].sum()
-
-        #     # 打印 top 3 non-image attention tokens:
-        #     ids = input_ids[0]
-        #     non_image_attn = last_token_attn.clone()
-        #     non_image_attn[image_token_indices] = -float("inf")
-        #     top_vals, top_pos = torch.topk(non_image_attn, k=3)
-        #     print("head:", h)
-        #     print("top 3 non-image attention tokens:")
-        #     for rank, (pos, val) in enumerate(zip(top_pos.tolist(), top_vals.tolist()), start=1):
-        #         token_id = ids[pos].item()
-        #         token = tokenizer.decode([token_id])
-        #         print(
-        #             rank,
-        #             "pos:", pos,
-        #             "attn:", val,
-        #             "token_id:", token_id,
-        #             "token:", repr(token)
-        #         )
-
-        #     # 计算 text_attn_sum
-        #     vision_end_id = tokenizer.convert_tokens_to_ids("<|vision_end|>")
-        #     im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
-        #     vision_end_pos = (ids == vision_end_id).nonzero(as_tuple=True)[0]
-        #     text_start = vision_end_pos[-1].item() + 1
-        #     im_end_pos_after_text = (ids[text_start:] == im_end_id).nonzero(as_tuple=True)[0]
-        #     text_end = text_start + im_end_pos_after_text[0].item()
-        #     text_mask = torch.zeros_like(ids, dtype=torch.bool)
-        #     text_mask[text_start:text_end] = True
-        #     text_attn_sum = last_token_attn[text_mask].sum()
-            
-        #     # 计算 other_attn_sum
-        #     total_attn_sum = last_token_attn.sum()
-        #     other_attn_sum = total_attn_sum - image_attn_sum - text_attn_sum
-        #     print("image attn sum:", image_attn_sum.item())
-        #     print("pure text attn sum:", text_attn_sum.item())
-        #     print("other/template attn sum:", other_attn_sum.item())
-        #     save_attn_sum_bar(
-        #         image_attn_sum=image_attn_sum.item(),
-        #         text_attn_sum=text_attn_sum.item(),
-        #         other_attn_sum=other_attn_sum.item(),
-        #         save_path=f"/data/research_users/liupengsheng/DeCK-image/attn_sum_bar/image2/head{h}_attn_sum_bar.png",
-        #         title=f"Head {h} Attention Sum",
-        #     )
-            
-        #     image_grid_thw = model_kwargs_h["image_grid_thw"]
-        #     grid_t, grid_h, grid_w = image_grid_thw[0].tolist()
-        #     merge_size = self.config.vision_config.spatial_merge_size
-        #     heatmap_h = grid_h // merge_size
-        #     heatmap_w = grid_w // merge_size
-        #     image_attn_map = last_token_attn[image_token_indices]
-        #     image_attn_map = image_attn_map.reshape(heatmap_h, heatmap_w)
-
-        #     remove_border = 2
-        #     image_attn_map = image_attn_map.clone()
-        #     image_attn_map[:remove_border, :] = 0
-        #     image_attn_map[-remove_border:, :] = 0
-        #     image_attn_map[:, :remove_border] = 0
-        #     image_attn_map[:, -remove_border:] = 0
-
-        #     if all_head_image_attn_map is None:
-        #         all_head_image_attn_map = torch.zeros_like(image_attn_map)
-        #     all_head_image_attn_map += image_attn_map.detach()
-        #     valid_head_num += 1
-
-        #     # 打印 top 10 image attention positions
-        #     top_vals, top_idx = torch.topk(image_attn_map.flatten(), k=10)
-        #     print("top 10 image attention positions:")
-        #     for rank, (idx, val) in enumerate(zip(top_idx.tolist(), top_vals.tolist()), start=1):
-        #         y = idx // heatmap_w
-        #         x = idx % heatmap_w
-        #         print(
-        #             rank,
-        #             "grid_y:", y,
-        #             "grid_x:", x,
-        #             "attn:", val
-        #         )
-
-        #     image_attn_map = image_attn_map.detach().float().cpu()
-
-        #     save_attention_heatmap(
-        #         image_attn_map=image_attn_map,
-        #         image_path="/data/research_users/liupengsheng/DeCK-image/headmap_result/image2.png",
-        #         save_path=f"/data/research_users/liupengsheng/DeCK-image/headmap_result/image2/head{h}_attention.png",
-        #         alpha=0.85,
-        #         blur_radius=30,
-        #         threshold=0,
-        #         power=1.5,
-        #         show=False,
-        #     )
 
 
         outputs, head_logits, head_hidden = self.enhance_prefill(input_ids, generation_config, model_kwargs, return_head_logits=True)
@@ -3542,82 +3182,17 @@ class GenerationMixin(ContinuousMixin):
         head_logits_student_probs = nn.functional.softmax(head_logits_student, dim=-1)
         head_logits_student_probs_masked = nn.functional.softmax(head_logits_student_masked, dim=-1)
 
-        # plot_valid_logits_by_token_id_paper(
-        #     head_logits_student_masked=head_logits_student_masked,
-        #     head_logits_masked=head_logits_masked,
-        #     tokenizer=tokenizer,
-        #     head_idx=16,
-        #     mode="intersection",
-        #     sort_by="diff",
-        #     top_k=20,
-        #     # keep_token_texts=[
-        #     #     "club", "stick", "iron", "rain", "black",
-        #     #     "power", "wood", "put", "driver", "umb"
-        #     # ],
-        #     # keep_token_texts=[
-        #     #     "cookie", "king", "pawn", "white", "Knight",
-        #     #     "piece", "black", "The", "ro", "ch"
-        #     # ],
-        #     keep_token_order=False,
-        #     figsize=(8, 5),
-        #     title="Head 16 Semantic Slot Logits",
-        #     save_path="/data/research_users/liupengsheng/DeCK-image/head_logits/image1/head16_mask.png",
-        # )
-
         next_token_logits_mask = next_token_logits_mask[:, None, :].expand(-1, head_logits.size(1), -1)
         next_token_logits_probs_masked = nn.functional.softmax(next_token_logits_mask, dim=-1)
         next_token_logits_student_mask = next_token_logits_student_mask[:, None, :].expand(-1, head_logits.size(1), -1)
         next_token_logits_student_probs_masked = nn.functional.softmax(next_token_logits_student_mask, dim=-1)
         
-        # m_probs = 0.5 * (head_logits_probs + head_logits_student_probs)
-        # head_js = 0.5 * torch.sum(head_logits_probs * (torch.log(head_logits_probs + 1e-9) - torch.log(m_probs + 1e-9)), dim=-1) \
-        #           + 0.5 * torch.sum(head_logits_student_probs * (torch.log(head_logits_student_probs + 1e-9) - torch.log(m_probs + 1e-9)), dim=-1)
         m_probs_masked = 0.5 * (head_logits_probs_masked + head_logits_student_probs_masked)
         head_js = 0.5 * torch.sum(head_logits_probs_masked * (torch.log(head_logits_probs_masked + 1e-9) - torch.log(m_probs_masked + 1e-9)), dim=-1) \
                   + 0.5 * torch.sum(head_logits_student_probs_masked * (torch.log(head_logits_student_probs_masked + 1e-9) - torch.log(m_probs_masked + 1e-9)), dim=-1)
         normalized_head_score = head_js[0] / head_js[0].max().clamp_min(1e-8)
         head_score = score_scale * normalized_head_score
         enhance_heads = torch.where(normalized_head_score >= head_threshold)[0].tolist()
-        # enhance_heads = torch.topk(normalized_head_score, k=min(2, normalized_head_score.numel())).indices.tolist()
-        # num_enhance_heads = torch.where(normalized_head_score >= head_threshold)[0].numel()
-        # enhance_heads = torch.randperm(
-        #     normalized_head_score.numel(),
-        #     device=normalized_head_score.device
-        # )[:num_enhance_heads].tolist()
-
-        # image_head_features = head_hidden[0].float()
-        # text_head_features = head_hidden_student[0].float()
-        # image_head_centered = (image_head_features - image_head_features.mean(dim=-1, keepdim=True))
-        # text_head_centered = (text_head_features - text_head_features.mean(dim=-1, keepdim=True))
-        # head_correlation_matrix = (nn.functional.normalize(image_head_centered, p=2, dim=-1,) @ nn.functional.normalize(text_head_centered, p=2, dim=-1,).transpose(0, 1))
-        # plot_head_correlation_heatmap(
-        #     head_correlation_matrix,
-        #     save_path="/data/research_users/liupengsheng/DeCK-image/appendix/head_correlation_heatmap/single_sample_head_hidden_correlation.png",
-        #     title="",
-        # )
-
-        # plot_head_score_token_logits_broken(
-        #     model=self,
-        #     input_ids=input_ids,
-        #     generation_config=generation_config,
-        #     model_kwargs_enhance=model_kwargs_enhance,
-        #     head_score=head_score,
-        #     next_token_logits=next_token_logits,
-        #     head_idx=20,
-        #     token_id_green=3551,
-        #     token_id_red=19862,
-        #     score_min=0,
-        #     score_max=4.8,
-        #     score_step=0.1,
-        #     save_path="/data/research_users/liupengsheng/DeCK-image/enhanced_next_token_logits/image1/head20.png",
-        #     title="Head 20 Enhancement Effect",
-        #     figsize=(8, 5),
-        #     smooth_window=6,
-        #     # y_pad=0.50,
-        #     y_pad=0.10,
-        #     legend_y=0.60,
-        #     enhance_scale=3.5,
-        # )
         
         outputs_enhance = self.enhance_prefill(input_ids, generation_config, model_kwargs_enhance, beta=head_score, enhance_heads=enhance_heads)
         next_token_logits_enhance = outputs_enhance.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
@@ -3662,21 +3237,13 @@ class GenerationMixin(ContinuousMixin):
                 next_token_logits_student_mask = next_token_logits_student_mask[:, None, :].expand(-1, head_logits.size(1), -1)
                 next_token_logits_student_probs_masked = nn.functional.softmax(next_token_logits_student_mask, dim=-1)
                 
-                # m_probs = 0.5 * (head_logits_probs + head_logits_student_probs)
-                # head_js = 0.5 * torch.sum(head_logits_probs * (torch.log(head_logits_probs + 1e-9) - torch.log(m_probs + 1e-9)), dim=-1) \
-                        # + 0.5 * torch.sum(head_logits_student_probs * (torch.log(head_logits_student_probs + 1e-9) - torch.log(m_probs + 1e-9)), dim=-1)
                 m_probs_masked = 0.5 * (head_logits_probs_masked + head_logits_student_probs_masked)
                 head_js = 0.5 * torch.sum(head_logits_probs_masked * (torch.log(head_logits_probs_masked + 1e-9) - torch.log(m_probs_masked + 1e-9)), dim=-1) \
                         + 0.5 * torch.sum(head_logits_student_probs_masked * (torch.log(head_logits_student_probs_masked + 1e-9) - torch.log(m_probs_masked + 1e-9)), dim=-1)
                 normalized_head_score = head_js[0] / head_js[0].max().clamp_min(1e-8)
                 head_score = score_scale * normalized_head_score
                 enhance_heads = torch.where(normalized_head_score >= head_threshold)[0].tolist()
-                # enhance_heads = torch.topk(normalized_head_score, k=min(2, normalized_head_score.numel())).indices.tolist()
-                # num_enhance_heads = torch.where(normalized_head_score >= head_threshold)[0].numel()
-                # enhance_heads = torch.randperm(
-                #     normalized_head_score.numel(),
-                #     device=normalized_head_score.device
-                # )[:num_enhance_heads].tolist()
+
 
                 model_inputs_enhance = self.prepare_inputs_for_generation(input_ids, **model_kwargs_enhance)
                 debug_cache_enhance = {}
@@ -3691,19 +3258,6 @@ class GenerationMixin(ContinuousMixin):
             logits_context_enhance[mask] = -1e10
             logits_enhance = next_token_logits_enhance - next_token_logits
             logits_enhance[mask] = -1e10
-
-            # plot_single_logits_by_token_id_paper(
-            #     logits_context_enhance=next_token_logits,
-            #     tokenizer=tokenizer,
-            #     head_idx=None,
-            #     batch_idx=0,
-            #     sort_by="value",
-            #     top_k=20,
-            #     title="Semantic Slot Next-Token Logits",
-            #     save_path="/data/research_users/liupengsheng/DeCK-image/appendix/semantic_slot_logits.png",
-            #     show=True,
-            # )
-
             next_token_logits = alpha * next_token_logits_student + (1 - alpha) * logits_context_enhance
             next_token_scores = logits_processor(input_ids, next_token_logits)
 

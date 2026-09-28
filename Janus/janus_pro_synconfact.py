@@ -14,7 +14,7 @@ def normalize_answer(x):
     return x.strip()
 
 # load data
-data_dir = "/data/research_users/liupengsheng/asset/confact"
+data_dir = "./data/SynConFact"
 dataset = load_dataset(
     "parquet",
     data_files={
@@ -32,25 +32,25 @@ train_data = dataset["train"]
 
 # load model
 model = AutoModelForCausalLM.from_pretrained(
-    "/data/research_users/liupengsheng/models/Janus-Pro-7B",
+    "./models/Janus-Pro-7B",
     trust_remote_code=True,
     torch_dtype=torch.bfloat16,
     device_map="auto",
     use_safetensors=False,
 )
 student_model = AutoModelForCausalLM.from_pretrained(
-    "/data/research_users/liupengsheng/models/Janus-Pro-7B",
+    "./models/Janus-Pro-7B",
     trust_remote_code=True,
     torch_dtype=torch.bfloat16,
     device_map="auto",
     use_safetensors=False,
 )
-processor = VLChatProcessor.from_pretrained("/data/research_users/liupengsheng/models/Janus-Pro-7B")
+processor = VLChatProcessor.from_pretrained("./models/Janus-Pro-7B")
 tokenizer = processor.tokenizer
 
 # save path
-save_path = "./result/janus_pro_confact/enhance_alpha0.4_adaptive0.8_1.jsonl"
-# save_path = "./result/janus_pro_confact/CK_alpha0.5.jsonl"
+save_path = "./result/janus_pro_synconfact/witness_alpha0.4_adaptive0.8_1.jsonl"
+os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
 # run
 batch_size = 1
@@ -105,13 +105,6 @@ for start in tqdm(range(0, len(train_data), batch_size)):
         inputs_embeds = model.prepare_inputs_embeds(**inputs)
         inputs_embeds_student = student_model.prepare_inputs_embeds(**inputs_student)
 
-    # with torch.inference_mode():
-    #     generated_ids = model.language_model.generate(inputs_embeds=inputs_embeds, inputs_embeds_student=inputs_embeds_student,
-    #                                                   deck_decoding=True, student_model=student_model.language_model,
-    #                                                   tokenizer=tokenizer, max_new_tokens=8, top_p=0.001, top_k=1,
-    #                                                   temperature=0.01, do_sample=True, alpha=0.5, adaptive=False, select_top=10,
-    #                                                   pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id)
-        
     with torch.inference_mode():
         generated_ids = model.language_model.generate(inputs_embeds=inputs_embeds, inputs_embeds_student=inputs_embeds_student,
                                                       enhance_decoding=True, student_model=student_model.language_model,
