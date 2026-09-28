@@ -4,7 +4,7 @@ Code for the paper **"Who Is the Real Witness? Localizing Attention Heads throug
 
 ## Overview
 
-![WITNESS](assets/witness_overview.png)
+![WITNESS](witness_overview.png)
 
 ## Setup
 
