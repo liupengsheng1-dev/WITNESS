@@ -23,6 +23,8 @@ pip install -e transformers-5.0.0.dev0
 
 Install only the Transformers version corresponding to the model you use. We recommend using separate environments for the two versions.
 
+## Model
+
 Place the Janus-Pro-7B checkpoint under:
 
 ```text
