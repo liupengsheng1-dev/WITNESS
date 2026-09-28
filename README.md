@@ -8,11 +8,20 @@ Code for the paper **"Who Is the Real Witness? Localizing Attention Heads throug
 
 ## Setup
 
+For Janus-Pro, install the modified Transformers 4.38.2 implementation and the Janus package:
+
 ```bash
 pip install -e transformers-4.38.2      # reference implementation for Janus-Pro
-pip install -e transformers-5.0.0.dev0  # modified generation implementation for newer Transformers-based LVLMs
 pip install -e Janus
 ```
+
+For Qwen2-VL and Qwen3-VL, use the modified Transformers 5.0.0.dev0 implementation:
+
+```bash
+pip install -e transformers-5.0.0.dev0
+```
+
+Install only the Transformers version corresponding to the model you use. We recommend using separate environments for the two versions.
 
 Place the Janus-Pro-7B checkpoint under:
 
