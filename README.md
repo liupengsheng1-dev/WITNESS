@@ -64,7 +64,7 @@ scene
 
 ### WHOOPS-AHA!
 
-Download the **WHOOPS-AHA!** dataset from Hugging Face (`francescortu/whoops-aha`) and place the parquet files under:
+Download the **WHOOPS-AHA!** dataset from [Hugging Face](https://huggingface.co/datasets/francescortu/whoops-aha) and place the parquet files under:
 
 ```text
 data/WHOOPS-AHA/
@@ -80,7 +80,7 @@ data/WHOOPS-AHA/
 
 ### MME
 
-Download the **MME** benchmark and place the converted parquet files under:
+Download the **MME** benchmark from [GitHub](https://github.com/BradyFU/Awesome-Multimodal-Large-Language-Models/tree/Evaluation) and place the converted parquet files under:
 
 ```text
 data/MME/
