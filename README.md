@@ -37,29 +37,22 @@ models/Janus-Pro-7B/
 
 ### SynConFact
 
-We provide the **SynConFact** dataset used in our experiments.
-
-Dataset:
-
-```text
-https://anonymous-hf.com/a/nxy6sf0rux3k/
-```
-
-Place the downloaded files under:
+Download Our **SynConFact** dataset from [Hugging Face](https://anonymous-hf.com/a/nxy6sf0rux3k/) and place the parquet files under:
 
 ```text
 data/SynConFact/
 ```
 
-SynConFact contains six categories:
+Expected structure:
 
 ```text
-animal
-attribute
-historical
-material
-object
-scene
+data/SynConFact/
+├── animal-00000-of-00001.parquet
+├── attribute-00000-of-00001.parquet
+├── historical-00000-of-00001.parquet
+├── material-00000-of-00001.parquet
+├── object-00000-of-00001.parquet
+└── scene-00000-of-00001.parquet
 ```
 
 ### WHOOPS-AHA!
@@ -80,7 +73,7 @@ data/WHOOPS-AHA/
 
 ### MME
 
-Download the **MME** benchmark from [GitHub](https://github.com/BradyFU/Awesome-Multimodal-Large-Language-Models/tree/Evaluation) and place the converted parquet files under:
+Download the **MME** dataset from [Hugging Face](https://huggingface.co/datasets/darkyarding/MME) and place the parquet files under:
 
 ```text
 data/MME/
