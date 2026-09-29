@@ -19,12 +19,12 @@ dataset = load_dataset(
     "parquet",
     data_files={
         "train": [
-            f"{data_dir}/animal/animal-00000-of-00001.parquet",
-            f"{data_dir}/attribute/attribute-00000-of-00001.parquet",
-            f"{data_dir}/historical/historical-00000-of-00001.parquet",
-            f"{data_dir}/material/material-00000-of-00001.parquet",
-            f"{data_dir}/object/object-00000-of-00001.parquet",
-            f"{data_dir}/scene/scene-00000-of-00001.parquet",
+            f"{data_dir}/animal-00000-of-00001.parquet",
+            f"{data_dir}/attribute-00000-of-00001.parquet",
+            f"{data_dir}/historical-00000-of-00001.parquet",
+            f"{data_dir}/material-00000-of-00001.parquet",
+            f"{data_dir}/object-00000-of-00001.parquet",
+            f"{data_dir}/scene-00000-of-00001.parquet",
         ]
     }
 )
