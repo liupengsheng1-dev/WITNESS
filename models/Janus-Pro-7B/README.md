@@ -1,1 +1,1 @@
-Place the Janus-Pro-7B checkpoint.
+Place the Janus-Pro-7B checkpoint under.
