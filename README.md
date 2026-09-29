@@ -30,7 +30,7 @@ Run all commands from the repository root directory.
 
 ## Model
 
-Place the Janus-Pro-7B checkpoint under:
+Download the **Janus-Pro-7B** checkpoint from [Hugging Face](https://huggingface.co/deepseek-ai/Janus-Pro-7B) and place the model files under:
 
 ```text
 models/Janus-Pro-7B/
