@@ -25,6 +25,9 @@ For Llava-NeXT, Qwen2-VL and Qwen3-VL, use the modified Transformers 5.0.0.dev0 
 pip install -e transformers-5.0.0.dev0      # reference implementation for Llava-NeXT, Qwen2-VL and Qwen3-VL
 ```
 
+Install only the Transformers version corresponding to the model you use. We recommend using separate environments for the two versions.
+Run all commands from the repository root directory.
+
 ## Model
 
 Place the Janus-Pro-7B checkpoint under:
