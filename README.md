@@ -8,6 +8,10 @@ Code for the paper **"Who Is the Real Witness? Localizing Attention Heads throug
 
 ## Setup
 
+```bash
+pip install datasets pillow scikit-learn
+```
+
 For Janus-Pro, install the modified Transformers 4.38.2 implementation and the Janus package:
 
 ```bash
@@ -20,8 +24,6 @@ For Llava-NeXT, Qwen2-VL and Qwen3-VL, use the modified Transformers 5.0.0.dev0 
 ```bash
 pip install -e transformers-5.0.0.dev0      # reference implementation for Llava-NeXT, Qwen2-VL and Qwen3-VL
 ```
-
-Install only the Transformers version corresponding to the model you use. We recommend using separate environments for the two versions.
 
 ## Model
 
